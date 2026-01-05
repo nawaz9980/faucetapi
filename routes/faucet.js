@@ -7,10 +7,10 @@ const axios = require('axios');
 const { normalizeIp } = require('../utils/helpers');
 
 // Faucet Settings
-const CLAIM_REWARD_MIN = 0.001;
-const CLAIM_REWARD_MAX = 0.002;
-const CLAIM_COOLDOWN_MS = 60 * 1000; // 1 minute
-const DAILY_LIMIT = 2;
+const CLAIM_REWARD_MIN = 0.0001;
+const CLAIM_REWARD_MAX = 0.0001;
+const CLAIM_COOLDOWN_MS = 10 * 1000; // 10 seconds
+const DAILY_LIMIT = 500;
 const REFERRAL_PERCENT = 10;
 
 const CAPTCHA_EMOJIS = [
@@ -134,8 +134,15 @@ router.post('/claim', auth, async (req, res) => {
                 params.append('amount', Math.round(payoutAmount * multiplier));
                 params.append('currency', CURRENCY);
                 if (isReferral) params.append('referral', 'true');
-                const response = await axios.post('https://faucetpay.io/api/v1/send', params);
-                if (response.data.status !== 200) throw new Error(response.data.message || 'FaucetPay Payout Failed');
+
+                const response = await axios.post('https://faucetpay.io/api/v1/send', params, {
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+                });
+
+                if (response.data.status !== 200) {
+                    console.error(`FaucetPay Error (${isReferral ? 'Referral' : 'User'}):`, response.data.message);
+                    throw new Error(response.data.message || 'FaucetPay Payout Failed');
+                }
                 return response.data;
             };
 
@@ -150,7 +157,7 @@ router.post('/claim', auth, async (req, res) => {
                     try {
                         await sendPayout(referrerRows[0].username, commission, true);
                     } catch (err) {
-                        // Silent fail for referral
+                        console.error('Referral Payout Failed for:', referrerRows[0].username, err.message);
                     }
                 }
             }
