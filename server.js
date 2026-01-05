@@ -107,8 +107,9 @@ const initDB = async () => {
     }
 };
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5001;
 server.listen(PORT, async () => {
     await initDB();
     console.log(`Server running on port ${PORT}`);
 });
+
