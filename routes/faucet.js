@@ -8,7 +8,7 @@ const { normalizeIp } = require('../utils/helpers');
 
 // Faucet Settings
 const CLAIM_REWARD_MIN = 0.0001;
-const CLAIM_REWARD_MAX = 0.0001;
+const CLAIM_REWARD_MAX = 0.0002;
 const CLAIM_COOLDOWN_MS = 10 * 1000; // 10 seconds
 const DAILY_LIMIT = 500;
 const REFERRAL_PERCENT = 10;
@@ -117,7 +117,8 @@ router.post('/claim', auth, async (req, res) => {
         const lastClaimTime = user.last_claim ? new Date(user.last_claim).getTime() : 0;
         if (now.getTime() - lastClaimTime < CLAIM_COOLDOWN_MS) return res.status(400).json({ error: 'Cooldown in progress' });
 
-        const amount = Math.random() < 0.1 ? CLAIM_REWARD_MAX : CLAIM_REWARD_MIN;
+        // Secure Backend Reward Calculation
+        const amount = parseFloat((Math.random() * (CLAIM_REWARD_MAX - CLAIM_REWARD_MIN) + CLAIM_REWARD_MIN).toFixed(8));
 
         const connection = await db.getConnection();
         await connection.beginTransaction();
@@ -140,7 +141,7 @@ router.post('/claim', auth, async (req, res) => {
                 });
 
                 if (response.data.status !== 200) {
-                    console.error(`FaucetPay Error (${isReferral ? 'Referral' : 'User'}):`, response.data.message);
+                    // console.error(`FaucetPay Error (${isReferral ? 'Referral' : 'User'}):`, response.data.message);
                     throw new Error(response.data.message || 'FaucetPay Payout Failed');
                 }
                 return response.data;
@@ -150,14 +151,16 @@ router.post('/claim', auth, async (req, res) => {
             const payoutId = payoutResult.payout_id || null;
 
             let commission = 0;
+            let referrerUsername = null;
             if (user.referred_by) {
                 const [referrerRows] = await db.execute('SELECT username FROM users WHERE id = ?', [user.referred_by]);
                 if (referrerRows.length > 0) {
                     commission = amount * (REFERRAL_PERCENT / 100);
+                    referrerUsername = referrerRows[0].username;
                     try {
-                        await sendPayout(referrerRows[0].username, commission, true);
+                        await sendPayout(referrerUsername, commission, true);
                     } catch (err) {
-                        console.error('Referral Payout Failed for:', referrerRows[0].username, err.message);
+                        // console.error('Referral Payout Failed for:', referrerUsername, err.message);
                     }
                 }
             }
@@ -168,16 +171,41 @@ router.post('/claim', auth, async (req, res) => {
             );
 
             await connection.execute(
-                'INSERT INTO claims (user_id, amount, payout_id, ip, fingerprint) VALUES (?, ?, ?, ?, ?)',
-                [req.user.id, amount, payoutId, ip, user.fingerprint || fingerprint]
+                'INSERT INTO claims (user_id, amount, referral_amount, referrer_id, payout_id, ip, fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                [req.user.id, amount, commission, user.referred_by || null, payoutId, ip, user.fingerprint || fingerprint]
             );
 
             await connection.commit();
 
             const io = req.app.get('io');
-            io.emit('new_payment', { username: user.username, amount: amount, claimed_at: now });
+            // console.log('📣 Emitting new_payment event for:', user.username);
+            io.emit('new_payment', {
+                id: Date.now(), // Unique ID for frontend keys
+                username: user.username,
+                amount: amount,
+                referral_amount: commission,
+                referrer_username: referrerUsername,
+                claimed_at: now
+            });
+            // console.log('✅ new_payment emitted');
 
-            res.json({ success: true, amount, claimsLeft: DAILY_LIMIT - (claimsToday + 1) });
+            // Broadcast Updated Global Stats
+            const [[globalStats]] = await db.execute(`
+                SELECT 
+                    (SELECT COUNT(*) FROM users) as totalUsers,
+                    (SELECT COALESCE(SUM(amount), 0) FROM claims) as totalClaimed,
+                    (SELECT COALESCE(SUM(referral_amount), 0) FROM claims) as totalReferralPaid
+            `);
+            io.emit('global_stats_update', globalStats);
+            // console.log('✅ global_stats_update emitted:', globalStats);
+
+            res.json({
+                success: true,
+                amount,
+                referral_amount: commission,
+                referrer_username: referrerUsername,
+                claimsLeft: DAILY_LIMIT - (claimsToday + 1)
+            });
         } catch (err) {
             await connection.rollback();
             return res.status(502).json({ error: err.message || 'FaucetPay service error' });
@@ -189,12 +217,33 @@ router.post('/claim', auth, async (req, res) => {
     }
 });
 
+router.get('/stats', async (req, res) => {
+    try {
+        const [[stats]] = await db.execute(`
+            SELECT 
+                (SELECT COUNT(*) FROM users) as totalUsers,
+                (SELECT COALESCE(SUM(amount), 0) FROM claims) as totalClaimed,
+                (SELECT COALESCE(SUM(referral_amount), 0) FROM claims) as totalReferralPaid
+        `);
+        res.json(stats);
+    } catch (error) {
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
 router.get('/recent-payments', async (req, res) => {
     try {
         const [rows] = await db.execute(`
-            SELECT c.id, u.username, c.amount, c.claimed_at 
+            SELECT 
+                c.id, 
+                u.username, 
+                c.amount, 
+                c.referral_amount, 
+                c.claimed_at,
+                r.username as referrer_username
             FROM claims c 
             JOIN users u ON c.user_id = u.id 
+            LEFT JOIN users r ON c.referrer_id = r.id
             ORDER BY c.claimed_at DESC 
             LIMIT 20
         `);
