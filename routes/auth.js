@@ -72,6 +72,22 @@ router.post('/login', async (req, res) => {
             );
             const [newUserRows] = await db.execute('SELECT * FROM users WHERE id = ?', [result.insertId]);
             user = newUserRows[0];
+
+            // Broadcast Updated Global Stats for new user registration
+            const io = req.app.get('io');
+            if (io) {
+                const [[globalStats]] = await db.execute(`
+                    SELECT 
+                        (SELECT COUNT(*) FROM users) as totalUsers,
+                        (SELECT COALESCE(SUM(amount), 0) FROM claims) as totalClaimed,
+                        (SELECT COALESCE(SUM(referral_amount), 0) FROM claims) as totalReferralPaid
+                `);
+                // console.log('📣 Emitting global_stats_update for new user join');
+                io.emit('global_stats_update', globalStats);
+                // console.log('✅ global_stats_update emitted');
+            } else {
+                // console.warn('⚠️ Registration: Socket.io instance not found');
+            }
         } else {
             user = rows[0];
             if (user.is_banned) {
