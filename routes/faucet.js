@@ -6,9 +6,16 @@ const jwt = require('jsonwebtoken');
 const axios = require('axios');
 const { normalizeIp } = require('../utils/helpers');
 
-// Faucet Settings
-const CLAIM_REWARD_MIN = 0.0001;
-const CLAIM_REWARD_MAX = 0.0002;
+// Helper to get settings
+const getSetting = async (key, defaultValue) => {
+    try {
+        const [rows] = await db.execute('SELECT setting_value FROM settings WHERE setting_key = ?', [key]);
+        return rows.length > 0 ? rows[0].setting_value : defaultValue;
+    } catch (err) {
+        return defaultValue;
+    }
+};
+
 const CLAIM_COOLDOWN_MS = 10 * 1000; // 10 seconds
 const DAILY_LIMIT = 500;
 const REFERRAL_PERCENT = 10;
@@ -73,10 +80,16 @@ router.get('/status', auth, async (req, res) => {
         const lastClaimTime = user.last_claim ? new Date(user.last_claim).getTime() : 0;
         const cooldownRemaining = Math.max(0, CLAIM_COOLDOWN_MS - (now.getTime() - lastClaimTime));
 
+        // Fetch dynamic rewards
+        const minReward = parseFloat(await getSetting('faucet_claim_min', '0.0001'));
+        const maxReward = parseFloat(await getSetting('faucet_claim_max', '0.0002'));
+
+        // console.log(`DEBUG: Status Reward Range: min=${minReward}, max=${maxReward}`);
+
         res.json({
             claimsLeft: Math.max(0, DAILY_LIMIT - claimsToday),
             cooldownRemaining,
-            rewardRange: { min: CLAIM_REWARD_MIN, max: CLAIM_REWARD_MAX }
+            rewardRange: { min: minReward, max: maxReward }
         });
     } catch (error) {
         res.status(500).json({ error: 'Server error' });
@@ -117,8 +130,12 @@ router.post('/claim', auth, async (req, res) => {
         const lastClaimTime = user.last_claim ? new Date(user.last_claim).getTime() : 0;
         if (now.getTime() - lastClaimTime < CLAIM_COOLDOWN_MS) return res.status(400).json({ error: 'Cooldown in progress' });
 
-        // Secure Backend Reward Calculation
-        const amount = parseFloat((Math.random() * (CLAIM_REWARD_MAX - CLAIM_REWARD_MIN) + CLAIM_REWARD_MIN).toFixed(8));
+        if (now.getTime() - lastClaimTime < CLAIM_COOLDOWN_MS) return res.status(400).json({ error: 'Cooldown in progress' });
+
+        // Secure Backend Reward Calculation from DB
+        const minReward = parseFloat(await getSetting('faucet_claim_min', '0.0001'));
+        const maxReward = parseFloat(await getSetting('faucet_claim_max', '0.0002'));
+        const amount = parseFloat((Math.random() * (maxReward - minReward) + minReward).toFixed(8));
 
         const connection = await db.getConnection();
         await connection.beginTransaction();
