@@ -11,7 +11,7 @@ const db = require('./config/db');
 const { normalizeIp } = require('./utils/helpers');
 
 const app = express();
-app.set('trust proxy', true);
+app.set('trust proxy', 1);
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
@@ -129,6 +129,19 @@ const initDB = async () => {
                 // Already exists or other error
             }
         }
+
+        // Create pending_claims table
+        await db.execute(`
+            CREATE TABLE IF NOT EXISTS pending_claims (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                challenge_id VARCHAR(255) UNIQUE NOT NULL,
+                target_name VARCHAR(50) NOT NULL,
+                claim_token VARCHAR(255) UNIQUE NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        `);
 
         // Unban everyone to clear false positives
         await db.execute('UPDATE users SET is_banned = 0, ban_reason = NULL');
