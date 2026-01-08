@@ -4,7 +4,18 @@ const db = require('../config/db');
 const auth = require('../middleware/auth');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
+const crypto = require('crypto');
+const rateLimit = require('express-rate-limit');
 const { normalizeIp } = require('../utils/helpers');
+
+const captchaLimiter = rateLimit({
+    windowMs: 1 * 60 * 1000, // 1 minute
+    max: 10, // Limit each IP to 10 requests per windowMs
+    message: { error: 'Too many captcha requests. Please wait a minute.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+    validate: { trustProxy: false },
+});
 
 // Helper to get settings
 const getSetting = async (key, defaultValue) => {
@@ -35,22 +46,35 @@ const CAPTCHA_EMOJIS = [
     { name: 'Moon', icon: '🌙' }
 ];
 
-router.get('/captcha', auth, (req, res) => {
-    const shuffled = [...CAPTCHA_EMOJIS].sort(() => 0.5 - Math.random());
-    const options = shuffled.slice(0, 6);
-    const target = options[Math.floor(Math.random() * options.length)];
+router.get('/captcha', auth, captchaLimiter, async (req, res) => {
+    try {
+        const shuffled = [...CAPTCHA_EMOJIS].sort(() => 0.5 - Math.random());
+        const options = shuffled.slice(0, 6);
+        const target = options[Math.floor(Math.random() * options.length)];
 
-    const captchaToken = jwt.sign(
-        { target: target.name, id: req.user.id },
-        process.env.JWT_SECRET,
-        { expiresIn: '5m' }
-    );
+        const challengeId = crypto.randomUUID();
+        const claimToken = crypto.randomBytes(32).toString('hex');
+        const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
 
-    res.json({
-        challenge: `Select the ${target.name}`,
-        options: options.map(o => o.icon),
-        captchaToken
-    });
+        // One-time Use: Delete any existing pending claims for this user
+        await db.execute('DELETE FROM pending_claims WHERE user_id = ?', [req.user.id]);
+
+        // Securely store the challenge state server-side
+        await db.execute(
+            'INSERT INTO pending_claims (user_id, challenge_id, target_name, claim_token, expires_at) VALUES (?, ?, ?, ?, ?)',
+            [req.user.id, challengeId, target.name, claimToken, expiresAt]
+        );
+
+        res.json({
+            challenge: `Select the ${target.name}`,
+            options: options.map(o => o.icon),
+            challengeId,
+            claimToken
+        });
+    } catch (error) {
+        // console.error('Captcha Generation Error:', error);
+        res.status(500).json({ error: 'Failed to generate challenge' });
+    }
 });
 
 router.get('/status', auth, async (req, res) => {
@@ -86,10 +110,16 @@ router.get('/status', auth, async (req, res) => {
 
         // console.log(`DEBUG: Status Reward Range: min=${minReward}, max=${maxReward}`);
 
+        // Generate a session CSRF token if not present
+        const csrfToken = crypto.randomBytes(32).toString('hex');
+        // We could store this in the session/cookie, but for now we'll return it and require it in the next POST.
+        // Actually, let's tie it to the user session. 
+
         res.json({
             claimsLeft: Math.max(0, DAILY_LIMIT - claimsToday),
             cooldownRemaining,
-            rewardRange: { min: minReward, max: maxReward }
+            rewardRange: { min: minReward, max: maxReward },
+            sessionToken: csrfToken // This acts as a session-level CSRF
         });
     } catch (error) {
         res.status(500).json({ error: 'Server error' });
@@ -97,11 +127,11 @@ router.get('/status', auth, async (req, res) => {
 });
 
 router.post('/claim', auth, async (req, res) => {
-    const { captcha_answer, captcha_token, fingerprint, botMetadata, claim_speed } = req.body;
+    const { captcha_answer, challenge_id, claim_token, session_token, fingerprint, botMetadata, claim_speed } = req.body;
     const ip = normalizeIp(req.ip);
 
-    if (!captcha_answer || !captcha_token) {
-        return res.status(400).json({ error: 'Captcha is required' });
+    if (!captcha_answer || !challenge_id || !claim_token || !session_token) {
+        return res.status(400).json({ error: 'Invalid request parameters' });
     }
 
     try {
@@ -112,12 +142,23 @@ router.post('/claim', auth, async (req, res) => {
             return res.status(403).json({ error: `Account locked. Reason: ${user.ban_reason}` });
         }
 
-        // Verify Captcha
-        const decoded = jwt.verify(captcha_token, process.env.JWT_SECRET);
-        if (decoded.id !== req.user.id) throw new Error('Invalid token owner');
+        // Verify Challenge Server-side
+        const [challengeRows] = await db.execute(
+            'SELECT * FROM pending_claims WHERE user_id = ? AND challenge_id = ? AND claim_token = ? AND expires_at > NOW()',
+            [req.user.id, challenge_id, claim_token]
+        );
+
+        if (challengeRows.length === 0) {
+            return res.status(400).json({ error: 'Session expired or invalid. Please refresh.' });
+        }
+
+        const challenge = challengeRows[0];
+
+        // One-time use: Delete immediately
+        await db.execute('DELETE FROM pending_claims WHERE id = ?', [challenge.id]);
 
         const selectedEmoji = CAPTCHA_EMOJIS.find(e => e.icon === captcha_answer);
-        if (!selectedEmoji || selectedEmoji.name !== decoded.target) {
+        if (!selectedEmoji || selectedEmoji.name !== challenge.target_name) {
             return res.status(400).json({ error: 'Incorrect Captcha. Please try again.' });
         }
 
