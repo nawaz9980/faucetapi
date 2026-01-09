@@ -93,8 +93,22 @@ router.post('/login', async (req, res) => {
             if (user.is_banned) {
                 return res.status(403).json({ error: `You are banned. Reason: ${user.ban_reason}` });
             }
-            // Update IP and fingerprint on login for existing users
-            await db.execute('UPDATE users SET last_ip = ?, fingerprint = ? WHERE id = ?', [ip, fingerprint, user.id]);
+
+            // Fingerprint Lock: Don't automatically update fingerprint if it's already set and different
+            // This prevents account sharing or bot rotation of devices for the same user
+            if (!user.fingerprint) {
+                await db.execute('UPDATE users SET last_ip = ?, fingerprint = ? WHERE id = ?', [ip, fingerprint, user.id]);
+            } else if (user.fingerprint !== fingerprint) {
+                // We keep the old fingerprint as the "Trusted" one, and only update the IP
+                await db.execute('UPDATE users SET last_ip = ? WHERE id = ?', [ip, user.id]);
+                // Log the mismatched fingerprint for security monitoring
+                await db.execute(
+                    'INSERT INTO security_logs (user_id, event_type, ip, fingerprint, details) VALUES (?, ?, ?, ?, ?)',
+                    [user.id, 'login_fingerprint_mismatch', ip, fingerprint, `Stored: ${user.fingerprint}, Received: ${fingerprint}`]
+                );
+            } else {
+                await db.execute('UPDATE users SET last_ip = ? WHERE id = ?', [ip, user.id]);
+            }
         }
 
         const token = jwt.sign({ id: user.id, username: user.username }, process.env.JWT_SECRET, { expiresIn: '7d' });
