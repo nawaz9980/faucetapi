@@ -46,11 +46,25 @@ const CAPTCHA_EMOJIS = [
     { name: 'Moon', icon: '🌙' }
 ];
 
+// Helper to convert emoji to a simple SVG Data URL to prevent plain-text scraping
+const emojiToDataUrl = (emoji) => {
+    // We use a base64 encoded SVG to hide the emoji character from simple text-based scrapers
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="60" height="60"><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" font-size="40">${emoji}</text></svg>`;
+    return `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`;
+};
+
 router.get('/captcha', auth, captchaLimiter, async (req, res) => {
     try {
         const shuffled = [...CAPTCHA_EMOJIS].sort(() => 0.5 - Math.random());
         const options = shuffled.slice(0, 6);
         const target = options[Math.floor(Math.random() * options.length)];
+
+        // Map icons to randomized IDs for the current request
+        const secureOptions = options.map(o => ({
+            id: crypto.randomBytes(8).toString('hex'),
+            name: o.name,
+            icon: o.icon
+        }));
 
         const challengeId = crypto.randomUUID();
         const claimToken = crypto.randomBytes(32).toString('hex');
@@ -61,13 +75,17 @@ router.get('/captcha', auth, captchaLimiter, async (req, res) => {
 
         // Securely store the challenge state server-side
         await db.execute(
-            'INSERT INTO pending_claims (user_id, challenge_id, target_name, claim_token, expires_at) VALUES (?, ?, ?, ?, ?)',
-            [req.user.id, challengeId, target.name, claimToken, expiresAt]
+            'INSERT INTO pending_claims (user_id, challenge_id, target_name, options_json, claim_token, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
+            [req.user.id, challengeId, target.name, JSON.stringify(secureOptions), claimToken, expiresAt]
         );
 
         res.json({
             challenge: `Select the ${target.name}`,
-            options: options.map(o => o.icon),
+            // Sending Data URLs instead of plain-text emoji icons
+            options: secureOptions.map(o => ({
+                id: o.id,
+                data: emojiToDataUrl(o.icon)
+            })),
             challengeId,
             claimToken
         });
@@ -110,16 +128,15 @@ router.get('/status', auth, async (req, res) => {
 
         // console.log(`DEBUG: Status Reward Range: min=${minReward}, max=${maxReward}`);
 
-        // Generate a session CSRF token if not present
+        // Generate a session CSRF token and save it to the user
         const csrfToken = crypto.randomBytes(32).toString('hex');
-        // We could store this in the session/cookie, but for now we'll return it and require it in the next POST.
-        // Actually, let's tie it to the user session. 
+        await db.execute('UPDATE users SET session_token = ? WHERE id = ?', [csrfToken, req.user.id]);
 
         res.json({
             claimsLeft: Math.max(0, DAILY_LIMIT - claimsToday),
             cooldownRemaining,
             rewardRange: { min: minReward, max: maxReward },
-            sessionToken: csrfToken // This acts as a session-level CSRF
+            sessionToken: csrfToken
         });
     } catch (error) {
         res.status(500).json({ error: 'Server error' });
@@ -135,11 +152,26 @@ router.post('/claim', auth, async (req, res) => {
     }
 
     try {
-        const [userCheck] = await db.execute('SELECT id, username, referred_by, last_claim, claims_today, last_reset_date, fingerprint, is_banned, ban_reason FROM users WHERE id = ?', [req.user.id]);
+        const [userCheck] = await db.execute('SELECT id, username, referred_by, last_claim, claims_today, last_reset_date, fingerprint, session_token, is_banned, ban_reason FROM users WHERE id = ?', [req.user.id]);
         const user = userCheck[0];
 
         if (user?.is_banned) {
             return res.status(403).json({ error: `Account locked. Reason: ${user.ban_reason}` });
+        }
+
+        // 1. Session Token Validation (MAJOR FIX)
+        if (!user.session_token || user.session_token !== session_token) {
+            return res.status(401).json({ error: 'Session expired or CSRF detected. Please refresh the page.' });
+        }
+
+        // 2. Fingerprint Trust Policy (MAJOR FIX)
+        if (user.fingerprint && user.fingerprint !== fingerprint) {
+            // Log security event for analysis
+            await db.execute(
+                'INSERT INTO security_logs (user_id, event_type, ip, fingerprint, details) VALUES (?, ?, ?, ?, ?)',
+                [user.id, 'fingerprint_mismatch', ip, fingerprint, `Stored: ${user.fingerprint}, Received: ${fingerprint}`]
+            );
+            return res.status(403).json({ error: 'Device mismatch. For security, please use your primary device.' });
         }
 
         // Verify Challenge Server-side
@@ -149,16 +181,18 @@ router.post('/claim', auth, async (req, res) => {
         );
 
         if (challengeRows.length === 0) {
-            return res.status(400).json({ error: 'Session expired or invalid. Please refresh.' });
+            return res.status(400).json({ error: 'Challenge expired or invalid. Please refresh.' });
         }
 
         const challenge = challengeRows[0];
+        const storedOptions = JSON.parse(challenge.options_json || '[]');
 
         // One-time use: Delete immediately
         await db.execute('DELETE FROM pending_claims WHERE id = ?', [challenge.id]);
 
-        const selectedEmoji = CAPTCHA_EMOJIS.find(e => e.icon === captcha_answer);
-        if (!selectedEmoji || selectedEmoji.name !== challenge.target_name) {
+        // Validate Captcha Answer using ID mapping (MAJOR FIX)
+        const selectedOption = storedOptions.find(o => o.id === captcha_answer);
+        if (!selectedOption || selectedOption.name !== challenge.target_name) {
             return res.status(400).json({ error: 'Incorrect Captcha. Please try again.' });
         }
 
@@ -169,8 +203,6 @@ router.post('/claim', auth, async (req, res) => {
 
         if (claimsToday >= DAILY_LIMIT) return res.status(400).json({ error: 'Daily claim limit reached' });
         const lastClaimTime = user.last_claim ? new Date(user.last_claim).getTime() : 0;
-        if (now.getTime() - lastClaimTime < CLAIM_COOLDOWN_MS) return res.status(400).json({ error: 'Cooldown in progress' });
-
         if (now.getTime() - lastClaimTime < CLAIM_COOLDOWN_MS) return res.status(400).json({ error: 'Cooldown in progress' });
 
         // Secure Backend Reward Calculation from DB
@@ -224,7 +256,7 @@ router.post('/claim', auth, async (req, res) => {
             }
 
             await connection.execute(
-                'UPDATE users SET last_claim = ?, claims_today = ?, last_reset_date = ?, last_ip = ?, fingerprint = ? WHERE id = ?',
+                'UPDATE users SET last_claim = ?, claims_today = ?, last_reset_date = ?, last_ip = ?, fingerprint = ?, session_token = NULL WHERE id = ?',
                 [now, claimsToday + 1, now.toISOString().split('T')[0], ip, user.fingerprint || fingerprint, req.user.id]
             );
 
