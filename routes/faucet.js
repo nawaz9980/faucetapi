@@ -17,6 +17,15 @@ const captchaLimiter = rateLimit({
     validate: { trustProxy: false },
 });
 
+const claimLimiter = rateLimit({
+    windowMs: 1 * 60 * 1000, // 1 minute
+    max: 5, // Limit each IP to 5 requests per windowMs
+    message: { error: 'Too many claim attempts. Please wait a minute.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+    validate: { trustProxy: false },
+});
+
 // Helper to get settings
 const getSetting = async (key, defaultValue) => {
     try {
@@ -143,7 +152,7 @@ router.get('/status', auth, async (req, res) => {
     }
 });
 
-router.post('/claim', auth, async (req, res) => {
+router.post('/claim', auth, claimLimiter, async (req, res) => {
     const { captcha_answer, challenge_id, claim_token, session_token, fingerprint, botMetadata, claim_speed } = req.body;
     const ip = normalizeIp(req.ip);
 
