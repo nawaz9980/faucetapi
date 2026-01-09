@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_ip VARCHAR(45),
     fingerprint VARCHAR(255),
+    session_token VARCHAR(255),
     is_banned BOOLEAN DEFAULT FALSE,
     ban_reason VARCHAR(255),
     FOREIGN KEY (referred_by) REFERENCES users(id) ON DELETE SET NULL
@@ -36,10 +37,28 @@ CREATE TABLE IF NOT EXISTS claims (
     id INT AUTO_INCREMENT PRIMARY KEY,
     user_id INT NOT NULL,
     amount DECIMAL(20, 8) NOT NULL,
+    referral_amount DECIMAL(20, 8) DEFAULT 0,
+    referrer_id INT,
     payout_id VARCHAR(255),
     ip VARCHAR(45),
     fingerprint VARCHAR(255),
     claimed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (referrer_id) REFERENCES users(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS settings (
+    setting_key VARCHAR(50) PRIMARY KEY,
+    setting_value VARCHAR(255) NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS pending_claims (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    challenge_id VARCHAR(255) UNIQUE NOT NULL,
+    target_name VARCHAR(50) NOT NULL,
+    options_json TEXT,
+    claim_token VARCHAR(255) UNIQUE NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
