@@ -79,6 +79,7 @@ const initDB = async () => {
         const columns = [
             { name: 'last_ip', type: 'VARCHAR(45)' },
             { name: 'fingerprint', type: 'VARCHAR(255)' },
+            { name: 'session_token', type: 'VARCHAR(255)' }, // For session-level CSRF validation
             { name: 'is_banned', type: 'BOOLEAN DEFAULT FALSE' },
             { name: 'ban_reason', type: 'VARCHAR(255)' }
         ];
@@ -137,11 +138,17 @@ const initDB = async () => {
                 user_id INT NOT NULL,
                 challenge_id VARCHAR(255) UNIQUE NOT NULL,
                 target_name VARCHAR(50) NOT NULL,
+                options_json TEXT, -- Store shuffled options for ID-based validation
                 claim_token VARCHAR(255) UNIQUE NOT NULL,
                 expires_at TIMESTAMP NOT NULL,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )
         `);
+
+        // Migration for existing pending_claims if needed
+        try {
+            await db.execute('ALTER TABLE pending_claims ADD COLUMN options_json TEXT');
+        } catch (err) { }
 
         // Unban everyone to clear false positives
         await db.execute('UPDATE users SET is_banned = 0, ban_reason = NULL');
